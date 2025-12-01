@@ -2,7 +2,7 @@
 import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { signInWithEmailAndPassword } from 'firebase/auth'
-import { collection, query, getDocs, doc, deleteDoc, addDoc, serverTimestamp, orderBy, limit } from 'firebase/firestore'
+import { collection, query, getDocs, doc, deleteDoc, addDoc, serverTimestamp, orderBy, limit, getDoc, where } from 'firebase/firestore'
 import { auth, db } from '../firebase/config'
 import { getCurrentDisplayPuzzle } from '../firebase/puzzleRotation'
 
@@ -23,6 +23,29 @@ const loadingPuzzles = ref(false);
 const activeTab = ref("queue"); // 'queue', 'approved', 'rejected', 'history'
 const displayPuzzle = ref(null);
 
+// UI State
+const notification = ref({ show: false, message: '', type: '' });
+const confirmModal = ref({ show: false, title: '', message: '', onConfirm: null });
+
+const showNotification = (message, type = 'success') => {
+  notification.value = { show: true, message, type };
+  setTimeout(() => {
+    notification.value.show = false;
+  }, 3000);
+};
+
+const showConfirm = (title, message, onConfirmAction) => {
+  confirmModal.value = {
+    show: true,
+    title,
+    message,
+    onConfirm: async () => {
+      await onConfirmAction();
+      confirmModal.value.show = false;
+    }
+  };
+};
+
 const pageTitle = computed(() => {
   switch (activeTab.value) {
     case 'queue': return 'Queue (Pending)'
@@ -37,22 +60,15 @@ const pageTitle = computed(() => {
 const fetchPendingPuzzles = async () => {
   loadingPuzzles.value = true;
   try {
-    console.log("Fetching waiting puzzles...");
     const q = query(collection(db, "waitingPuzzles"));
     const querySnapshot = await getDocs(q);
-    console.log("Query result:", querySnapshot.size, "documents found");
-    pendingPuzzles.value = querySnapshot.docs.map((doc) => {
-      console.log("Document data:", doc.id, doc.data());
-      return {
-        id: doc.id,
-        ...doc.data(),
-      };
-    });
-    console.log("Waiting puzzles:", pendingPuzzles.value);
+    pendingPuzzles.value = querySnapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
   } catch (e) {
     console.error("Error fetching puzzles:", e);
-    console.error("Error code:", e.code);
-    console.error("Error message:", e.message);
+    showNotification("Error fetching pending puzzles", "error");
   } finally {
     loadingPuzzles.value = false;
   }
@@ -69,6 +85,7 @@ const fetchApprovedPuzzles = async () => {
     }));
   } catch (e) {
     console.error("Error fetching approved puzzles:", e);
+    showNotification("Error fetching approved puzzles", "error");
   } finally {
     loadingPuzzles.value = false;
   }
@@ -102,6 +119,7 @@ const fetchRejectedPuzzles = async () => {
     }));
   } catch (e) {
     console.error("Error fetching rejected puzzles:", e);
+    showNotification("Error fetching rejected puzzles", "error");
   } finally {
     loadingPuzzles.value = false;
   }
@@ -122,6 +140,7 @@ const fetchHistoryPuzzles = async () => {
     }));
   } catch (e) {
     console.error("Error fetching history puzzles:", e);
+    showNotification("Error fetching history", "error");
   } finally {
     loadingPuzzles.value = false;
   }
@@ -211,9 +230,11 @@ const approve = async (id) => {
     // Remove from whichever list it might be in
     pendingPuzzles.value = pendingPuzzles.value.filter((p) => p.id !== id);
     rejectedPuzzles.value = rejectedPuzzles.value.filter((p) => p.id !== id);
+    
+    showNotification("Puzzle approved successfully!", "success");
   } catch (e) {
     console.error("Error approving puzzle:", e);
-    alert("Failed to approve puzzle");
+    showNotification("Failed to approve puzzle", "error");
   }
 };
 
@@ -248,74 +269,74 @@ const reject = async (id) => {
     // Remove from whichever list it might be in
     pendingPuzzles.value = pendingPuzzles.value.filter((p) => p.id !== id);
     approvedPuzzles.value = approvedPuzzles.value.filter((p) => p.id !== id);
+    
+    showNotification("Puzzle rejected", "success");
   } catch (e) {
     console.error("Error rejecting puzzle:", e);
-    alert("Failed to reject puzzle");
+    showNotification("Failed to reject puzzle", "error");
   }
 };
 
 const deletePuzzle = async (id) => {
-  if (!confirm("Are you sure you want to permanently delete this puzzle?")) {
-    return;
-  }
-  
-  try {
-    // Determine which collection the puzzle is in
-    let sourceCollection = "waitingPuzzles";
-    if (approvedPuzzles.value.find((p) => p.id === id)) {
-      sourceCollection = "approvedPuzzles";
-    } else if (rejectedPuzzles.value.find((p) => p.id === id)) {
-      sourceCollection = "rejectedPuzzles";
-    } else if (historyPuzzles.value.find((p) => p.id === id)) {
-      sourceCollection = "historyPuzzles";
+  showConfirm("Delete Puzzle", "Are you sure you want to permanently delete this puzzle?", async () => {
+    try {
+      // Determine which collection the puzzle is in
+      let sourceCollection = "waitingPuzzles";
+      if (approvedPuzzles.value.find((p) => p.id === id)) {
+        sourceCollection = "approvedPuzzles";
+      } else if (rejectedPuzzles.value.find((p) => p.id === id)) {
+        sourceCollection = "rejectedPuzzles";
+      } else if (historyPuzzles.value.find((p) => p.id === id)) {
+        sourceCollection = "historyPuzzles";
+      }
+      
+      await deleteDoc(doc(db, sourceCollection, id));
+      
+      // Remove from whichever list it might be in
+      pendingPuzzles.value = pendingPuzzles.value.filter((p) => p.id !== id);
+      approvedPuzzles.value = approvedPuzzles.value.filter((p) => p.id !== id);
+      rejectedPuzzles.value = rejectedPuzzles.value.filter((p) => p.id !== id);
+      historyPuzzles.value = historyPuzzles.value.filter((p) => p.id !== id);
+      
+      showNotification("Puzzle deleted permanently", "success");
+    } catch (e) {
+      console.error("Error deleting puzzle:", e);
+      showNotification("Failed to delete puzzle", "error");
     }
-    
-    await deleteDoc(doc(db, sourceCollection, id));
-    
-    // Remove from whichever list it might be in
-    pendingPuzzles.value = pendingPuzzles.value.filter((p) => p.id !== id);
-    approvedPuzzles.value = approvedPuzzles.value.filter((p) => p.id !== id);
-    rejectedPuzzles.value = rejectedPuzzles.value.filter((p) => p.id !== id);
-    historyPuzzles.value = historyPuzzles.value.filter((p) => p.id !== id);
-  } catch (e) {
-    console.error("Error deleting puzzle:", e);
-    alert("Failed to delete puzzle");
-  }
+  });
 };
 
 const rejectDisplayPuzzle = async () => {
   if (!displayPuzzle.value) return;
   
-  if (!confirm("Are you sure you want to remove the current live puzzle? It will be moved to the Rejected list.")) {
-    return;
-  }
+  showConfirm("Remove Live Puzzle", "Are you sure you want to remove the current live puzzle? It will be moved to the Rejected list.", async () => {
+    try {
+      // Add to rejectedPuzzles
+      await addDoc(collection(db, "rejectedPuzzles"), {
+        movieName: displayPuzzle.value.movieName,
+        submittedBy: displayPuzzle.value.submittedBy,
+        clues: displayPuzzle.value.clues,
+        createdAt: displayPuzzle.value.createdAt || serverTimestamp(),
+        rejectedAt: serverTimestamp(),
+        rejectedFromDisplay: true
+      });
 
-  try {
-    // Add to rejectedPuzzles
-    await addDoc(collection(db, "rejectedPuzzles"), {
-      movieName: displayPuzzle.value.movieName,
-      submittedBy: displayPuzzle.value.submittedBy,
-      clues: displayPuzzle.value.clues,
-      createdAt: displayPuzzle.value.createdAt || serverTimestamp(),
-      rejectedAt: serverTimestamp(),
-      rejectedFromDisplay: true
-    });
+      // Delete from displayPuzzle
+      await deleteDoc(doc(db, "displayPuzzle", "current"));
 
-    // Delete from displayPuzzle
-    await deleteDoc(doc(db, "displayPuzzle", "current"));
-
-    displayPuzzle.value = null;
-    
-    // Refresh rejected list if active
-    if (activeTab.value === 'rejected') {
-      fetchRejectedPuzzles();
+      displayPuzzle.value = null;
+      
+      // Refresh rejected list if active
+      if (activeTab.value === 'rejected') {
+        fetchRejectedPuzzles();
+      }
+      
+      showNotification("Puzzle removed from display and rejected.", "success");
+    } catch (e) {
+      console.error("Error rejecting display puzzle:", e);
+      showNotification("Failed to remove puzzle", "error");
     }
-    
-    alert("Puzzle removed from display and rejected.");
-  } catch (e) {
-    console.error("Error rejecting display puzzle:", e);
-    alert("Failed to remove puzzle");
-  }
+  });
 };
 
 const logout = async () => {
@@ -333,6 +354,25 @@ const logout = async () => {
 
 <template>
   <div class="admin-view">
+    <!-- Notification Toast -->
+    <transition name="slide-down">
+      <div v-if="notification.show" :class="['notification', notification.type]">
+        {{ notification.message }}
+      </div>
+    </transition>
+
+    <!-- Confirmation Modal -->
+    <div v-if="confirmModal.show" class="modal-overlay">
+      <div class="modal-content glass-panel">
+        <h3>{{ confirmModal.title }}</h3>
+        <p>{{ confirmModal.message }}</p>
+        <div class="modal-actions">
+          <button @click="confirmModal.show = false" class="btn-cancel">Cancel</button>
+          <button @click="confirmModal.onConfirm" class="btn-confirm">Confirm</button>
+        </div>
+      </div>
+    </div>
+
     <div class="header-container">
       <div class="titles">
         <h1 class="title">Admin Dashboard</h1>
@@ -438,6 +478,7 @@ const logout = async () => {
       </div>
 
       <div v-else class="puzzles-list">
+        <!-- ... existing list ... -->
         <div
           v-for="puzzle in activeTab === 'queue'
             ? pendingPuzzles
@@ -449,6 +490,7 @@ const logout = async () => {
           :key="puzzle.id"
           class="puzzle-card glass-panel"
         >
+          <!-- ... existing card content ... -->
           <div class="puzzle-header">
             <div class="puzzle-info">
               <h3 class="movie-title">🎬 {{ puzzle.movieName }}</h3>
@@ -505,6 +547,9 @@ const logout = async () => {
           </div>
         </div>
       </div>
+
+      <!-- Bottom Left: 3D Scoreboard (Removed) -->
+      <!-- Bottom Right: Online Users (Removed) -->
     </div>
   </div>
 </template>
@@ -1108,5 +1153,115 @@ const logout = async () => {
   display: flex;
   align-items: center;
   white-space: nowrap;
+}
+
+/* Notification Styles */
+.notification {
+  position: fixed;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 1rem 2rem;
+  border-radius: 8px;
+  font-weight: 500;
+  z-index: 1000;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.notification.error {
+  background: rgba(239, 68, 68, 0.9);
+  border: 1px solid #f87171;
+  color: white;
+}
+
+.notification.success {
+  background: rgba(34, 197, 94, 0.9);
+  border: 1px solid #4ade80;
+  color: white;
+}
+
+.slide-down-enter-active,
+.slide-down-leave-active {
+  transition: all 0.3s ease;
+}
+
+.slide-down-enter-from,
+.slide-down-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-20px);
+}
+
+/* Modal Styles */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 2000;
+}
+
+.modal-content {
+  background: #1e293b;
+  padding: 2rem;
+  border-radius: 16px;
+  max-width: 400px;
+  width: 90%;
+  text-align: center;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--glass-border);
+}
+
+.modal-content h3 {
+  margin-top: 0;
+  color: white;
+  font-size: 1.5rem;
+}
+
+.modal-content p {
+  color: rgba(255, 255, 255, 0.7);
+  margin-bottom: 2rem;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: center;
+  gap: 1rem;
+}
+
+.btn-cancel,
+.btn-confirm {
+  padding: 0.75rem 1.5rem;
+  border-radius: 8px;
+  border: none;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.2s;
+}
+
+.btn-cancel {
+  background: rgba(255, 255, 255, 0.1);
+  color: white;
+}
+
+.btn-cancel:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.btn-confirm {
+  background: var(--primary-color);
+  color: white;
+}
+
+.btn-confirm:hover {
+  filter: brightness(1.1);
+  transform: translateY(-2px);
 }
 </style>

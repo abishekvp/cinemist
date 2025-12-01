@@ -4,6 +4,7 @@ import { collection, addDoc, serverTimestamp, query, getDocs } from 'firebase/fi
 import { db } from '../firebase/config'
 
 const movieName = ref('')
+const alternateNames = ref('')
 const username = ref('')
 const clues = ref(['', '', '', '', ''])
 const submitted = ref(false)
@@ -81,9 +82,16 @@ const submitPuzzle = async () => {
   }
 
   try {
+    // Process alternate names
+    const altNamesArray = alternateNames.value
+      .split(',')
+      .map(name => name.trim())
+      .filter(name => name.length > 0)
+
     // Save to Firestore - waitingPuzzles collection
     await addDoc(collection(db, 'waitingPuzzles'), {
       movieName: movieName.value,
+      alternateNames: altNamesArray,
       submittedBy: username.value,
       clues: clues.value,
       createdAt: serverTimestamp()
@@ -93,6 +101,7 @@ const submitPuzzle = async () => {
     
     // Reset form
     movieName.value = ''
+    alternateNames.value = ''
     username.value = ''
     clues.value = ['', '', '', '', '']
   } catch (e) {
@@ -104,12 +113,7 @@ const submitPuzzle = async () => {
 
 <template>
   <div class="submit-view">
-    <!-- Notification Toast -->
-    <transition name="slide-down">
-      <div v-if="notification.show" :class="['notification', notification.type]">
-        {{ notification.message }}
-      </div>
-    </transition>
+    <!-- ... (existing notification) ... -->
 
     <h1 class="title">Publish a Puzzle</h1>
 
@@ -122,6 +126,17 @@ const submitPuzzle = async () => {
       <div class="form-group">
         <label>Movie Name</label>
         <input v-model="movieName" type="text" class="input-field" placeholder="e.g. The Matrix" />
+      </div>
+
+      <div class="form-group">
+        <label>Alternative Titles (Optional)</label>
+        <input 
+          v-model="alternateNames" 
+          type="text" 
+          class="input-field" 
+          placeholder="e.g. Matrix, Matrix 1 (comma separated)" 
+        />
+        <small class="hint-text">Helps with spelling variations</small>
       </div>
 
       <div class="form-group">
@@ -297,5 +312,13 @@ const submitPuzzle = async () => {
 .slide-down-leave-to {
   opacity: 0;
   transform: translateX(-50%) translateY(-20px);
+}
+
+.hint-text {
+  display: block;
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.5);
+  margin-top: 0.25rem;
+  font-style: italic;
 }
 </style>

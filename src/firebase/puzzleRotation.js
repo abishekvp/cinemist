@@ -177,6 +177,12 @@ export const rotatePuzzleIfNeeded = async () => {
         return { success: true, newPuzzle: true };
       } else {
         console.log('No approved puzzles available for rotation');
+        
+        // Delete the expired puzzle from display so it doesn't show as live
+        if (puzzle) {
+           await deleteDoc(doc(db, 'displayPuzzle', 'current'));
+        }
+        
         return { success: false, reason: 'no_approved_puzzles' };
       }
     } else {

@@ -189,10 +189,28 @@ async function rotatePuzzleLogic() {
   // Move current to history if exists
   if (displayDoc.exists) {
     const currentPuzzle = displayDoc.data();
+    
+    // Get stats before moving
+    const statsRef = db.collection('puzzleStats').doc('current');
+    const statsDoc = await statsRef.get();
+    const stats = statsDoc.exists ? statsDoc.data() : {};
+
     await db.collection('historyPuzzles').add({
       ...currentPuzzle,
+      finalStats: stats, // Save stats directly in history doc
       movedToHistoryAt: admin.firestore.FieldValue.serverTimestamp()
     });
+    
+    // Archive stats to separate collection as well (optional, but good for backup/indexing)
+    if (statsDoc.exists) {
+      await db.collection('historyStats').doc(displayDoc.id).set({
+        ...stats,
+        puzzleId: displayDoc.id,
+        archivedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      // Reset current stats
+      await statsRef.delete();
+    }
   }
   
   // Get next approved puzzle
@@ -253,3 +271,90 @@ exports.manualRotatePuzzle = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError('internal', error.message);
   }
 });
+
+/**
+ * Submit a solution for the current puzzle
+ * Tracks unique solvers by IP to prevent duplicate counts
+ */
+exports.submitSolution = functions.https.onCall(async (data, context) => {
+  const { clueIndex } = data;
+  const ip = context.rawRequest.ip || 'unknown';
+  const ipHash = require('crypto').createHash('md5').update(ip).digest('hex');
+  
+  const statsRef = db.collection('puzzleStats').doc('current');
+  const solverRef = statsRef.collection('solvers').doc(ipHash);
+  
+  try {
+    await db.runTransaction(async (t) => {
+      const solverDoc = await t.get(solverRef);
+      
+      if (solverDoc.exists) {
+        // User already solved this puzzle
+        return;
+      }
+      
+      const statsDoc = await t.get(statsRef);
+      let stats = statsDoc.exists ? statsDoc.data() : { clueCounts: {} };
+      
+      // Initialize clue counts if needed
+      if (!stats.clueCounts) stats.clueCounts = {};
+      if (!stats.clueCounts[clueIndex]) stats.clueCounts[clueIndex] = 0;
+      
+      // Increment count for this clue
+      stats.clueCounts[clueIndex]++;
+      
+      t.set(statsRef, stats, { merge: true });
+      t.set(solverRef, { 
+        solvedAt: admin.firestore.FieldValue.serverTimestamp(),
+        clueIndex: clueIndex
+      });
+    });
+    
+    return { success: true };
+  } catch (error) {
+    console.error('Error submitting solution:', error);
+    throw new functions.https.HttpsError('internal', 'Failed to submit solution');
+  }
+});
+
+/**
+ * Ping to indicate user presence
+ * Stores active user IP hash with timestamp
+ */
+exports.pingPresence = functions.https.onCall(async (data, context) => {
+  const ip = context.rawRequest.ip || 'unknown';
+  const ipHash = require('crypto').createHash('md5').update(ip).digest('hex');
+  
+  try {
+    await db.collection('activeUsers').doc(ipHash).set({
+      lastActive: admin.firestore.FieldValue.serverTimestamp()
+    });
+    return { success: true };
+  } catch (error) {
+    console.error('Error pinging presence:', error);
+    return { success: false };
+  }
+});
+
+/**
+ * Cleanup inactive users (older than 10 minutes)
+ * Runs every 15 minutes
+ */
+exports.cleanupActiveUsers = functions.pubsub
+  .schedule('every 15 minutes')
+  .onRun(async (context) => {
+    const cutoff = new Date(Date.now() - 10 * 60 * 1000); // 10 mins ago
+    
+    const snapshot = await db.collection('activeUsers')
+      .where('lastActive', '<', cutoff)
+      .get();
+      
+    if (snapshot.empty) return null;
+    
+    const batch = db.batch();
+    snapshot.docs.forEach(doc => batch.delete(doc.ref));
+    
+    await batch.commit();
+    console.log(`Cleaned up ${snapshot.size} inactive users`);
+    return null;
+  });
