@@ -71,6 +71,7 @@ export const checkDisplayPuzzleExpiry = async () => {
 
 /**
  * Move expired puzzle to history
+ * @deprecated Use Cloud Function instead
  */
 export const moveToHistory = async (puzzleData) => {
   try {
@@ -120,6 +121,7 @@ export const getNextApprovedPuzzle = async () => {
 
 /**
  * Set a new puzzle as the display puzzle with expiry
+ * @deprecated Use Cloud Function instead
  */
 export const setDisplayPuzzle = async (puzzle) => {
   try {
@@ -157,33 +159,43 @@ export const rotatePuzzleIfNeeded = async () => {
   try {
     console.log('Checking if puzzle rotation is needed...');
     
-    const { expired, puzzle } = await checkDisplayPuzzleExpiry();
+    const { expired } = await checkDisplayPuzzleExpiry();
     
     if (expired) {
-      console.log('Puzzle expired or missing, rotating...');
+      console.log('Puzzle expired or missing, triggering server-side rotation...');
       
-      // Move expired puzzle to history (if exists)
-      if (puzzle) {
-        await moveToHistory(puzzle);
-      }
-      
-      // Get next approved puzzle
-      const nextPuzzle = await getNextApprovedPuzzle();
-      
-      if (nextPuzzle) {
-        // Set as display puzzle
-        await setDisplayPuzzle(nextPuzzle);
-        console.log('Successfully rotated to new puzzle');
-        return { success: true, newPuzzle: true };
-      } else {
-        console.log('No approved puzzles available for rotation');
+      try {
+        // Use direct fetch to onRequest function to bypass CORS/IAM issues
+        const functionUrl = 'https://us-central1-movieguess-434ae.cloudfunctions.net/checkAndRotatePublic';
+        const response = await fetch(functionUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({})
+        });
         
-        // Delete the expired puzzle from display so it doesn't show as live
-        if (puzzle) {
-           await deleteDoc(doc(db, 'displayPuzzle', 'current'));
+        const result = await response.json();
+        
+        if (result.rotated) {
+          console.log('Successfully rotated to new puzzle via server');
+          return { success: true, newPuzzle: true };
+        } else {
+          console.log('Server reported no rotation needed (or failed gracefully)');
+          
+          // Check if we still have no puzzle after attempt
+          const { expired: stillExpired } = await checkDisplayPuzzleExpiry();
+          if (stillExpired) {
+             return { success: false, reason: 'no_approved_puzzles' };
+          }
+          return { success: true, newPuzzle: false };
         }
-        
-        return { success: false, reason: 'no_approved_puzzles' };
+      } catch (fnError) {
+        console.error('Error calling rotation cloud function:', fnError);
+        // Fallback for admins: try direct write if function fails (e.g. local emulator issues)
+        // This will only work if authenticated largely due to rules
+        // But we return error to avoid confusing behavior
+        return { success: false, error: fnError };
       }
     } else {
       console.log('Current puzzle is still valid');

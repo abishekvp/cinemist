@@ -1,5 +1,6 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
+const cors = require('cors')({origin: true});
 
 // Initialize Firebase Admin
 admin.initializeApp();
@@ -270,6 +271,46 @@ exports.manualRotatePuzzle = functions.https.onCall(async (data, context) => {
     console.error('Error in manual rotation:', error);
     throw new functions.https.HttpsError('internal', error.message);
   }
+});
+
+/**
+ * Public callable to ensure puzzle is fresh (lazy rotation)
+ * Safe to call by anyone as logic is strictly time-based
+ */
+/**
+ * Public callable to ensure puzzle is fresh (lazy rotation)
+ * Uses onRequest with manual CORS to avoid IAM preflight issues for public access
+ */
+exports.checkAndRotatePublic = functions.https.onRequest((req, res) => {
+  return cors(req, res, async () => {
+    try {
+      const displayDocRef = db.collection('displayPuzzle').doc('current');
+      const displayDoc = await displayDocRef.get();
+      
+      if (!displayDoc.exists) {
+         console.log('No display puzzle found, triggering public rotation...');
+         await rotatePuzzleLogic();
+         return res.json({ rotated: true });
+      }
+      
+      const puzzleData = displayDoc.data();
+      const expiryDate = puzzleData.expiryDate?.toDate();
+      const now = new Date();
+      
+      // Only rotate if actually expired
+      if (!expiryDate || now > expiryDate) {
+        console.log('Display puzzle expired, triggering public rotation...');
+        await rotatePuzzleLogic();
+        return res.json({ rotated: true });
+      }
+      
+      return res.json({ rotated: false });
+    } catch (error) {
+      console.error('Error in public checkAndRotate:', error);
+      // Return 200 with error info to prevent client side generic failures
+      return res.status(200).json({ rotated: false, error: error.message });
+    }
+  });
 });
 
 /**

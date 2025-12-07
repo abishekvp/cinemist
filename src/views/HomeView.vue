@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import { rotatePuzzleIfNeeded, getCurrentDisplayPuzzle } from "../firebase/puzzleRotation";
-import { doc, getDoc, collection, query, where, getDocs } from "firebase/firestore";
+import { doc, getDoc, collection, query, where, getDocs, setDoc, onSnapshot } from "firebase/firestore";
 import { db } from "../firebase/config";
 import confetti from "canvas-confetti";
 import ClueCard from "../components/ClueCard.vue";
@@ -13,8 +13,8 @@ const loading = ref(true);
 const noPuzzle = ref(false);
 const puzzleStats = ref({});
 const onlineCount = ref(0);
-let statsInterval = null;
-let onlineInterval = null;
+let statsUnsubscribe = null;
+let onlineUnsubscribe = null;
 
 const currentClueIndex = ref(0);
 const gameState = ref("playing"); // playing, won, lost
@@ -25,29 +25,36 @@ const isLastClue = computed(() => {
   return currentClueIndex.value === puzzle.value.clues.length - 1;
 });
 
-const fetchPuzzleStats = async () => {
-  try {
-    const docRef = doc(db, "puzzleStats", "current");
-    const docSnap = await getDoc(docRef);
+// Real-time listener for puzzle stats
+const setupStatsListener = () => {
+  const statsRef = doc(db, "puzzleStats", "current");
+  statsUnsubscribe = onSnapshot(statsRef, (docSnap) => {
     if (docSnap.exists()) {
       puzzleStats.value = docSnap.data().clueCounts || {};
     } else {
       puzzleStats.value = {};
     }
-  } catch (e) {
-    console.error("Error fetching stats:", e);
-  }
+  }, (error) => {
+    console.error("Error listening to stats:", error);
+  });
 };
 
-const fetchOnlineUsers = async () => {
-  try {
-    const cutoff = new Date(Date.now() - 5 * 60 * 1000);
-    const q = query(collection(db, "activeUsers"), where("lastActive", ">", cutoff));
-    const snapshot = await getDocs(q);
+// Real-time listener for online users
+const setupOnlineListener = () => {
+  const cutoff = new Date(Date.now() - 5 * 60 * 1000);
+  const q = query(collection(db, "activeUsers"), where("lastActive", ">", cutoff));
+  
+  onlineUnsubscribe = onSnapshot(q, (snapshot) => {
     onlineCount.value = snapshot.size;
-  } catch (e) {
-    console.error("Error fetching online users:", e);
-  }
+  }, (error) => {
+    console.error("Error listening to online users:", error);
+  });
+  
+  // Update cutoff every minute
+  setInterval(() => {
+    if (onlineUnsubscribe) onlineUnsubscribe();
+    setupOnlineListener();
+  }, 60000);
 };
 
 const saveProgress = () => {
@@ -78,17 +85,49 @@ const loadProgress = () => {
   }
 };
 
-import { httpsCallable } from 'firebase/functions';
-import { functions } from '../firebase/config';
+const pingPresence = async () => {
+  try {
+    // Create a simple hash from timestamp and random number for uniqueness
+    const sessionId = localStorage.getItem('cinemist_session') || 
+      `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    localStorage.setItem('cinemist_session', sessionId);
+    
+    const userRef = doc(db, 'activeUsers', sessionId);
+    await setDoc(userRef, {
+      lastActive: new Date()
+    });
+  } catch (e) {
+    console.error("Error pinging presence:", e);
+  }
+};
 
-// ... (existing imports)
-
-// ... (existing state)
-
-const pingPresence = httpsCallable(functions, 'pingPresence');
-const submitSolution = httpsCallable(functions, 'submitSolution');
-
-// ... (existing functions)
+const submitSolutionStats = async (clueIndex) => {
+  try {
+    const sessionId = localStorage.getItem('cinemist_session');
+    const puzzleId = puzzle.value.id || puzzle.value.sourceId || 'current';
+    const solverKey = `${puzzleId}_${sessionId}`;
+    
+    // Check if already solved
+    const alreadySolved = localStorage.getItem(`solved_${solverKey}`);
+    if (alreadySolved) return;
+    
+    const statsRef = doc(db, 'puzzleStats', 'current');
+    const statsDoc = await getDoc(statsRef);
+    
+    let clueCounts = {};
+    if (statsDoc.exists()) {
+      clueCounts = statsDoc.data().clueCounts || {};
+    }
+    
+    if (!clueCounts[clueIndex]) clueCounts[clueIndex] = 0;
+    clueCounts[clueIndex]++;
+    
+    await setDoc(statsRef, { clueCounts }, { merge: true });
+    localStorage.setItem(`solved_${solverKey}`, 'true');
+  } catch (e) {
+    console.error("Error submitting solution stats:", e);
+  }
+};
 
 onMounted(async () => {
   try {
@@ -107,10 +146,10 @@ onMounted(async () => {
     if (displayPuzzle) {
       puzzle.value = displayPuzzle;
       loadProgress();
-      fetchPuzzleStats();
-      fetchOnlineUsers();
-      statsInterval = setInterval(fetchPuzzleStats, 60000);
-      onlineInterval = setInterval(fetchOnlineUsers, 60000);
+      
+      // Setup real-time listeners
+      setupStatsListener();
+      setupOnlineListener();
       
       // Start pinging presence
       pingPresence();
@@ -126,9 +165,57 @@ onMounted(async () => {
   }
 });
 
-// ... (existing onUnmounted and watch)
+onUnmounted(() => {
+  if (statsUnsubscribe) statsUnsubscribe();
+  if (onlineUnsubscribe) onlineUnsubscribe();
+});
 
-// ... (existing levenshtein functions)
+import { watch } from 'vue';
+watch([currentClueIndex, gameState], () => {
+  saveProgress();
+});
+
+// Levenshtein distance for fuzzy matching
+const levenshteinDistance = (a, b) => {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  const matrix = [];
+
+  for (let i = 0; i <= b.length; i++) {
+    matrix[i] = [i];
+  }
+
+  for (let j = 0; j <= a.length; j++) {
+    matrix[0][j] = j;
+  }
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+
+  return matrix[b.length][a.length];
+};
+
+const getSimilarity = (s1, s2) => {
+  const longer = s1.length > s2.length ? s1 : s2;
+  const shorter = s1.length > s2.length ? s2 : s1;
+  const longerLength = longer.length;
+  if (longerLength === 0) {
+    return 1.0;
+  }
+  return (longerLength - levenshteinDistance(longer, shorter)) / parseFloat(longerLength);
+};
 
 const handleGuess = async (guess) => {
   if (gameState.value !== "playing") return;
@@ -156,9 +243,8 @@ const handleGuess = async (guess) => {
     
     // Submit solution stats
     try {
-      await submitSolution({ clueIndex: currentClueIndex.value });
-      // Refresh stats to show your own contribution
-      fetchPuzzleStats();
+      await submitSolutionStats(currentClueIndex.value);
+      // Stats will auto-update via real-time listener
     } catch (e) {
       console.error("Error submitting solution stats:", e);
     }
@@ -472,6 +558,18 @@ const fireConfetti = () => {
   gap: 0.5rem;
   margin-bottom: 0.5rem;
   font-size: 0.85rem;
+  animation: slideInLeft 0.3s ease;
+}
+
+@keyframes slideInLeft {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 .stat-label {
@@ -481,17 +579,32 @@ const fireConfetti = () => {
 
 .stat-bar-container {
   flex: 1;
-  height: 6px;
+  height: 8px;
   background: rgba(255, 255, 255, 0.1);
-  border-radius: 3px;
+  border-radius: 4px;
   overflow: hidden;
+  position: relative;
 }
 
 .stat-bar {
   height: 100%;
   background: linear-gradient(90deg, var(--primary-color), var(--accent-color));
-  border-radius: 3px;
-  transition: width 0.5s ease;
+  border-radius: 4px;
+  transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  animation: shimmer 2s infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    box-shadow: 0 0 5px rgba(168, 85, 247, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 15px rgba(168, 85, 247, 0.8);
+  }
+  100% {
+    box-shadow: 0 0 5px rgba(168, 85, 247, 0.5);
+  }
 }
 
 .stat-count {
@@ -499,6 +612,21 @@ const fireConfetti = () => {
   text-align: right;
   font-weight: bold;
   color: white;
+  transition: all 0.3s ease;
+}
+
+.stat-count:has(+ .stat-bar[style*="width"]) {
+  animation: countPulse 0.5s ease;
+}
+
+@keyframes countPulse {
+  0%, 100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.2);
+    color: var(--accent-color);
+  }
 }
 
 .online-counter-3d {
@@ -544,11 +672,39 @@ const fireConfetti = () => {
   color: #6ee7b7;
   font-weight: 600;
   font-size: 1rem;
+  transition: all 0.3s ease;
+}
+
+.online-content:hover .online-text {
+  color: #10b981;
+  transform: scale(1.05);
 }
 
 @keyframes pulse-green {
-  0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
-  70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+  0% { 
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+    transform: scale(1);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(16, 185, 129, 0);
+    transform: scale(1.1);
+  }
+  100% { 
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+    transform: scale(1);
+  }
+}
+
+@keyframes breathe {
+  0%, 100% {
+    transform: rotateY(-10deg) rotateX(5deg) scale(1);
+  }
+  50% {
+    transform: rotateY(-10deg) rotateX(5deg) scale(1.02);
+  }
+}
+
+.online-content {
+  animation: breathe 3s ease-in-out infinite;
 }
 </style>
